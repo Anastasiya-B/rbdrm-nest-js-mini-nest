@@ -4,27 +4,39 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import { Container } from './container';
 import {
+  createRequestId,
+  runWithRequestContext,
+} from './context/request-context';
+import {
   PARAMS_METADATA_KEY,
   type ParametersMetadata,
 } from './decorators/params';
-import { ValidationException, ValidationPipe } from './pipes/validation.pipe';
+import { ExceptionFilter } from './filters/exception.filter';
+import {
+  AllowAllGuard,
+  defaultMiddleware,
+  PassThroughInterceptor,
+} from './lifecycle-defaults';
+import type {
+  ExecutionContext,
+  Guard,
+  Interceptor,
+  Middleware,
+  Pipe,
+} from './lifecycle';
+import { ZodValidationPipe } from './pipes/zod-validation.pipe';
 import { createRoutes, matchRoute, type RegisteredRoute } from './router';
 
 type Constructor<T = unknown> = new (...args: any[]) => T;
 
 type ControllerInstance = Record<string, (...args: any[]) => unknown>;
 
-const BUILT_IN_TYPES: Constructor[] = [String, Number, Boolean, Array, Object];
-
-const shouldValidate = (
-  metatype: Constructor | undefined,
-): metatype is Constructor => {
-  if (!metatype) {
-    return false;
-  }
-
-  return !BUILT_IN_TYPES.includes(metatype);
-};
+export interface DispatcherOptions {
+  middleware?: Middleware;
+  guard?: Guard;
+  interceptor?: Interceptor;
+  pipe?: Pipe;
+}
 
 const readJsonBody = async (req: IncomingMessage): Promise<unknown> => {
   const chunks: Buffer[] = [];
@@ -61,62 +73,112 @@ const sendJson = (
 export class Dispatcher {
   private readonly routes: RegisteredRoute[];
 
-  private readonly validationPipe = new ValidationPipe();
+  private readonly middleware: Middleware;
+
+  private readonly guard: Guard;
+
+  private readonly interceptor: Interceptor;
+
+  private readonly pipe: Pipe;
+
+  private readonly exceptionFilter = new ExceptionFilter();
 
   constructor(
     private readonly container: Container,
     controllers: Constructor[],
+    options: DispatcherOptions = {},
   ) {
     this.routes = createRoutes(controllers);
+
+    this.middleware = options.middleware ?? defaultMiddleware;
+
+    this.guard = options.guard ?? new AllowAllGuard();
+
+    this.interceptor = options.interceptor ?? new PassThroughInterceptor();
+
+    this.pipe = options.pipe ?? new ZodValidationPipe();
   }
 
   handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    try {
-      const method = req.method ?? 'GET';
+    const incomingRequestId = req.headers['x-request-id'];
 
-      const url = new URL(req.url ?? '/', 'http://localhost');
+    const requestId = createRequestId(
+      Array.isArray(incomingRequestId)
+        ? incomingRequestId[0]
+        : incomingRequestId,
+    );
 
-      const matchedRoute = matchRoute(this.routes, method, url.pathname);
+    res.setHeader('X-Request-Id', requestId);
 
-      if (!matchedRoute) {
-        sendJson(res, 404, {
-          statusCode: 404,
-          message: 'Not Found',
+    await runWithRequestContext(requestId, async () => {
+      try {
+        const method = req.method ?? 'GET';
+
+        const url = new URL(req.url ?? '/', 'http://localhost');
+
+        const context: ExecutionContext = {
+          req,
+          res,
+          method,
+          path: url.pathname,
+        };
+
+        await this.middleware(context, async () => {
+          await this.dispatch(context, url);
         });
-
-        return;
+      } catch (error) {
+        this.exceptionFilter.catch(error, res);
       }
+    });
+  };
 
-      const { route, params } = matchedRoute;
+  private async dispatch(context: ExecutionContext, url: URL): Promise<void> {
+    const matchedRoute = matchRoute(this.routes, context.method, url.pathname);
 
-      const controller = this.container.resolve(
-        route.controller,
-      ) as unknown as ControllerInstance;
+    if (!matchedRoute) {
+      sendJson(context.res, 404, {
+        statusCode: 404,
+        message: 'Not Found',
+      });
 
-      const parameterMetadata: ParametersMetadata =
-        Reflect.getMetadata(
-          PARAMS_METADATA_KEY,
-          route.controller.prototype,
-          route.handlerName,
-        ) ?? {};
+      return;
+    }
 
-      const parameterTypes: Constructor[] =
-        Reflect.getMetadata(
-          'design:paramtypes',
-          route.controller.prototype,
-          route.handlerName,
-        ) ?? [];
+    const canActivate = await this.guard.canActivate(context);
 
-      const requiresBody = Object.values(parameterMetadata).some(
-        metadata => metadata.type === 'body',
-      );
+    if (!canActivate) {
+      sendJson(context.res, 403, {
+        statusCode: 403,
+        message: 'Forbidden',
+      });
 
-      let body: unknown;
+      return;
+    }
 
-      if (requiresBody) {
-        body = await readJsonBody(req);
-      }
+    const { route, params } = matchedRoute;
 
+    const controller = this.container.resolve(
+      route.controller,
+    ) as unknown as ControllerInstance;
+
+    const parameterMetadata: ParametersMetadata =
+      Reflect.getMetadata(
+        PARAMS_METADATA_KEY,
+        route.controller.prototype,
+        route.handlerName,
+      ) ?? {};
+
+    const requiresBody = Object.values(parameterMetadata).some(
+      metadata => metadata.type === 'body',
+    );
+
+    let body: unknown;
+
+    if (requiresBody) {
+      body = await readJsonBody(context.req);
+    }
+
+    const result = await this.interceptor.intercept(context, async () => {
       const args: unknown[] = [];
 
       for (const [indexAsString, metadata] of Object.entries(
@@ -135,44 +197,19 @@ export class Dispatcher {
               : undefined;
             break;
 
-          case 'body': {
-            const metatype = parameterTypes[index];
-
-            if (!shouldValidate(metatype)) {
-              args[index] = body;
-              break;
-            }
-
-            args[index] = await this.validationPipe.transform(body, metatype);
-
+          case 'body':
+            args[index] = await this.pipe.transform(body, metadata.schema);
             break;
-          }
         }
       }
 
       const handler = controller[route.handlerName];
 
-      const result = await handler.apply(controller, args);
+      return handler.apply(controller, args);
+    });
 
-      const statusCode = route.httpMethod === 'POST' ? 201 : 200;
+    const statusCode = route.httpMethod === 'POST' ? 201 : 200;
 
-      sendJson(res, statusCode, result ?? null);
-    } catch (error) {
-      if (error instanceof ValidationException) {
-        sendJson(res, 400, {
-          statusCode: 400,
-          message: 'Validation failed',
-          errors: error.errors,
-        });
-
-        return;
-      }
-
-      sendJson(res, 500, {
-        statusCode: 500,
-        message:
-          error instanceof Error ? error.message : 'Internal Server Error',
-      });
-    }
-  };
+    sendJson(context.res, statusCode, result ?? null);
+  }
 }

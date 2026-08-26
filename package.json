@@ -19,9 +19,8 @@
   },
   "homepage": "https://github.com/Anastasiya-B/rbdrm-nest-js-mini-nest#readme",
   "dependencies": {
-    "class-transformer": "^0.5.1",
-    "class-validator": "^0.15.1",
-    "reflect-metadata": "^0.2.2"
+    "reflect-metadata": "^0.2.2",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
