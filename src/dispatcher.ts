@@ -26,6 +26,7 @@ import type {
 } from './lifecycle';
 import { ZodValidationPipe } from './pipes/zod-validation.pipe';
 import { createRoutes, matchRoute, type RegisteredRoute } from './router';
+import { BadRequestError } from './errors/bad-request.error';
 
 type Constructor<T = unknown> = new (...args: any[]) => T;
 
@@ -55,7 +56,11 @@ const readJsonBody = async (req: IncomingMessage): Promise<unknown> => {
     return undefined;
   }
 
-  return JSON.parse(rawBody);
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    throw new BadRequestError('Invalid JSON body');
+  }
 };
 
 const sendJson = (

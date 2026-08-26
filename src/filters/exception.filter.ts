@@ -1,5 +1,6 @@
 import type { ServerResponse } from 'node:http';
 
+import { BadRequestError } from '../errors/bad-request.error';
 import { NotFoundError } from '../errors/not-found.error';
 import { ValidationError } from '../pipes/zod-validation.pipe';
 
@@ -22,6 +23,15 @@ export class ExceptionFilter {
         statusCode: 400,
         message: 'Validation failed',
         errors: error.errors,
+      });
+
+      return;
+    }
+
+    if (error instanceof BadRequestError) {
+      sendJson(res, 400, {
+        statusCode: 400,
+        message: error.message,
       });
 
       return;

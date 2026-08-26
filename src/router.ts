@@ -31,6 +31,32 @@ const normalizePath = (...parts: string[]): string => {
   return `/${normalized}`;
 };
 
+const splitPath = (path: string): string[] => {
+  return path.split('/').filter(Boolean);
+};
+
+const getPrototypeMethodNames = (prototype: object): string[] => {
+  const methodNames = new Set<string>();
+
+  let currentPrototype: object | null = prototype;
+
+  while (currentPrototype && currentPrototype !== Object.prototype) {
+    for (const propertyName of Object.getOwnPropertyNames(currentPrototype)) {
+      if (propertyName !== 'constructor') {
+        methodNames.add(propertyName);
+      }
+    }
+
+    currentPrototype = Object.getPrototypeOf(currentPrototype);
+  }
+
+  return [...methodNames];
+};
+
+const countDynamicSegments = (path: string): number => {
+  return splitPath(path).filter(segment => segment.startsWith(':')).length;
+};
+
 export const createRoutes = (controllers: Constructor[]): RegisteredRoute[] => {
   const routes: RegisteredRoute[] = [];
 
@@ -40,16 +66,26 @@ export const createRoutes = (controllers: Constructor[]): RegisteredRoute[] => {
 
     const prototype = Controller.prototype;
 
-    const methodNames = Object.getOwnPropertyNames(prototype).filter(
-      propertyName => propertyName !== 'constructor',
-    );
+    const methodNames = getPrototypeMethodNames(prototype);
 
     for (const handlerName of methodNames) {
-      const routeMetadata = Reflect.getMetadata(
-        ROUTE_METADATA_KEY,
-        prototype,
-        handlerName,
-      ) as RouteMetadata | undefined;
+      let currentPrototype: object | null = prototype;
+
+      let routeMetadata: RouteMetadata | undefined;
+
+      while (currentPrototype && currentPrototype !== Object.prototype) {
+        routeMetadata = Reflect.getOwnMetadata(
+          ROUTE_METADATA_KEY,
+          currentPrototype,
+          handlerName,
+        ) as RouteMetadata | undefined;
+
+        if (routeMetadata) {
+          break;
+        }
+
+        currentPrototype = Object.getPrototypeOf(currentPrototype);
+      }
 
       if (!routeMetadata) {
         continue;
@@ -64,11 +100,10 @@ export const createRoutes = (controllers: Constructor[]): RegisteredRoute[] => {
     }
   }
 
-  return routes;
-};
-
-const splitPath = (path: string): string[] => {
-  return path.split('/').filter(Boolean);
+  return routes.sort(
+    (left, right) =>
+      countDynamicSegments(left.path) - countDynamicSegments(right.path),
+  );
 };
 
 export const matchRoute = (
@@ -94,12 +129,14 @@ export const matchRoute = (
 
     for (let index = 0; index < routeSegments.length; index += 1) {
       const routeSegment = routeSegments[index];
+
       const requestSegment = requestSegments[index];
 
       if (routeSegment.startsWith(':')) {
         const paramName = routeSegment.slice(1);
 
         params[paramName] = decodeURIComponent(requestSegment);
+
         continue;
       }
 

@@ -29,6 +29,54 @@ docker compose run --rm api npm test
 npm run build
 ```
 
+## Run HTTP server
+
+Start the example mini-Nest HTTP server on port `3000`:
+
+```bash
+npm start
+```
+
+The server exposes an example route:
+
+```text
+GET /users/:id
+```
+
+Example request:
+
+```bash
+curl -si http://localhost:3000/users/1
+```
+
+The response contains an automatically generated request id:
+
+```text
+X-Request-Id: <generated-id>
+```
+
+The same request id is also available inside nested services through `AsyncLocalStorage`.
+
+You can provide your own request id:
+
+```bash
+curl -si \
+  -H "X-Request-Id: my-request-123" \
+  http://localhost:3000/users/1
+```
+
+The server returns the same value in the response:
+
+```text
+X-Request-Id: my-request-123
+```
+
+To check only the request-id header:
+
+```bash
+curl -si http://localhost:3000/users/1 | grep -i x-request-id
+```
+
 ## How IoC works
 
 Classes that can be created by the container are marked with `@Injectable()`.
@@ -113,6 +161,27 @@ matches the route and produces:
 as route parameters.
 
 Routes are discovered from decorator metadata rather than from a hardcoded array of application paths.
+
+### Route priority
+
+Static routes are matched before dynamic parameter routes.
+
+For example, when both routes exist:
+
+```text
+GET /users/me
+GET /users/:id
+```
+
+a request to:
+
+```text
+GET /users/me
+```
+
+is handled by the static `me` route instead of treating `me` as the value of `id`.
+
+The router also walks the prototype chain, so decorated routes inherited from a base controller are discovered correctly.
 
 ## Parameter decorators
 
@@ -316,6 +385,25 @@ A regular parameter such as:
 
 receives the parsed plain JavaScript object.
 
+Malformed JSON is treated as a client error.
+
+For example:
+
+```text
+{not json
+```
+
+returns:
+
+```json
+{
+  "statusCode": 400,
+  "message": "Invalid JSON body"
+}
+```
+
+instead of being exposed as an internal server error.
+
 ## Zod validation pipe
 
 DTO validation is implemented with Zod 4.
@@ -397,6 +485,7 @@ The current mappings are:
 
 ```text
 ValidationError  -> 400
+BadRequestError  -> 400
 NotFoundError    -> 404
 unknown error    -> 500
 ```
@@ -408,6 +497,8 @@ throw new NotFoundError('User 42 not found');
 ```
 
 is returned as an HTTP `404` with a meaningful message.
+
+A malformed JSON body results in `BadRequestError` and is returned as HTTP `400`.
 
 Unexpected errors are hidden from the client.
 
@@ -494,7 +585,7 @@ This behavior is verified by a test that sends ten concurrent requests with diff
 
 ## Example requests
 
-Dynamic route parameter:
+### Dynamic route parameter
 
 ```text
 GET /users/42
@@ -517,7 +608,7 @@ passes:
 
 to the controller method.
 
-Query parameter:
+### Query parameter
 
 ```text
 GET /users?limit=5
@@ -540,7 +631,7 @@ passes:
 
 as a separate method argument.
 
-POST body with Zod validation:
+### POST body with Zod validation
 
 ```text
 POST /users
@@ -565,6 +656,8 @@ create(
 
 passes the validated and transformed body to the handler.
 
+### Request id
+
 A client-provided request id:
 
 ```text
@@ -572,6 +665,14 @@ X-Request-Id: client-request-123
 ```
 
 is available in deep services through `AsyncLocalStorage` and is returned unchanged in the response header.
+
+Example:
+
+```bash
+curl -si \
+  -H "X-Request-Id: client-request-123" \
+  http://localhost:3000/users/1
+```
 
 ## Tests
 
@@ -586,9 +687,12 @@ The test suite covers:
 - parameter metadata and argument indexes
 - controller prefix and method path composition
 - static and dynamic route matching
+- static routes taking priority over dynamic `:param` routes
+- inherited controller route discovery
 - `@Param()` injection
 - `@Query()` injection
 - `@Body()` parsing
+- malformed JSON returning HTTP 400
 - HTTP 404 responses
 - controller dependency resolution through the IoC container
 - exact request lifecycle order
@@ -614,5 +718,35 @@ npm test
 or inside Docker:
 
 ```bash
+docker compose run --rm api npm test
+```
+
+## Acceptance checks
+
+Check that no prohibited frameworks are used:
+
+```bash
+grep -RE "@nestjs|express|fastify" package.json src/
+```
+
+The command should return no matches.
+
+Check that Zod is used:
+
+```bash
+grep -rn "from 'zod'" src/
+```
+
+Check request-id usage in services:
+
+```bash
+grep -n "requestId" src/services/*.ts
+```
+
+Run the complete local verification:
+
+```bash
+npm test
+npm run build
 docker compose run --rm api npm test
 ```

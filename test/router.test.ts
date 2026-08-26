@@ -113,4 +113,41 @@ describe('router', () => {
 
     expect(match).toBeNull();
   });
+
+  it('matches static route before dynamic route', () => {
+    @Controller('users')
+    class UsersController {
+      @Get(':id')
+      findOne() {}
+
+      @Get('me')
+      getMe() {}
+    }
+
+    const routes = createRoutes([UsersController]);
+
+    const match = matchRoute(routes, 'GET', '/users/me');
+
+    expect(match?.route.handlerName).toBe('getMe');
+
+    expect(match?.params).toEqual({});
+  });
+
+  it('collects decorated routes from base controller prototype', () => {
+    class BaseController {
+      @Get('inherited')
+      inherited() {}
+    }
+
+    @Controller('kids')
+    class KidsController extends BaseController {}
+
+    const routes = createRoutes([KidsController]);
+
+    const match = matchRoute(routes, 'GET', '/kids/inherited');
+
+    expect(match).not.toBeNull();
+
+    expect(match?.route.handlerName).toBe('inherited');
+  });
 });

@@ -285,4 +285,38 @@ describe('Dispatcher', () => {
 
     expect(response.status).toBe(404);
   });
+
+  it('returns 400 for malformed JSON body', async () => {
+    @Controller('users')
+    class UsersController {
+      @Post()
+      create(
+        @Body()
+        body: object,
+      ) {
+        return body;
+      }
+    }
+
+    const dispatcher = new Dispatcher(new Container(), [UsersController]);
+
+    const { server, baseUrl } = await startServer(dispatcher);
+
+    servers.push(server);
+
+    const response = await fetch(`${baseUrl}/users`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: '{not json',
+    });
+
+    expect(response.status).toBe(400);
+
+    expect(await response.json()).toEqual({
+      statusCode: 400,
+      message: 'Invalid JSON body',
+    });
+  });
 });
