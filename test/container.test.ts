@@ -1,8 +1,9 @@
 import 'reflect-metadata';
 import { describe, expect, it } from 'vitest';
+import 'reflect-metadata';
 
 import { Container } from '../src/container';
-import { Inject } from '../src/decorators/inject';
+import { Inject, INJECT_TOKENS_METADATA_KEY } from '../src/decorators/inject';
 import { Injectable, SCOPE_METADATA_KEY } from '../src/decorators/injectable';
 import { TOKENS } from '../src/tokens';
 
@@ -141,4 +142,46 @@ describe('Container', () => {
     expect(thrownError).toBeInstanceOf(Error);
     expect(thrownError).not.toBeInstanceOf(RangeError);
   });
+
+  it('throws an error for interface dependency without @Inject', () => {
+    interface Config {
+      apiUrl: string;
+    }
+
+    @Injectable()
+    class ApiService {
+      constructor(public config: Config) {}
+    }
+
+    const container = new Container();
+
+    expect(() => container.resolve(ApiService)).toThrow(
+      /Use @Inject\(token\) for interfaces/,
+    );
+  });
+});
+
+it('does not overwrite parent inject metadata', () => {
+  const TOKEN_1 = Symbol('T1');
+  const TOKEN_2 = Symbol('T2');
+
+  class Parent {
+    constructor(_value: unknown) {}
+  }
+
+  Inject(TOKEN_1)(Parent, undefined, 0);
+
+  class Child extends Parent {}
+
+  Inject(TOKEN_2)(Child, undefined, 0);
+
+  const parentTokens = Reflect.getOwnMetadata(
+    INJECT_TOKENS_METADATA_KEY,
+    Parent,
+  );
+
+  const childTokens = Reflect.getOwnMetadata(INJECT_TOKENS_METADATA_KEY, Child);
+
+  expect(parentTokens[0]).toBe(TOKEN_1);
+  expect(childTokens[0]).toBe(TOKEN_2);
 });

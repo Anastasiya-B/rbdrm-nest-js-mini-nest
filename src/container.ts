@@ -48,12 +48,18 @@ export class Container {
     const dependencies = paramTypes.map((Dependency, index) => {
       const token = injectTokens[index];
 
-      if (token) {
+      if (token !== undefined) {
         if (!this.tokenValues.has(token)) {
           throw new Error(`No value registered for token ${String(token)}`);
         }
 
         return this.tokenValues.get(token);
+      }
+
+      if (Dependency === Object) {
+        throw new Error(
+          `Cannot resolve dependency at index ${index} of ${Target.name}. Use @Inject(token) for interfaces.`,
+        );
       }
 
       return this.resolveTarget(Dependency, nextPath);
