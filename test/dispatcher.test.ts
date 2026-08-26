@@ -10,7 +10,7 @@ import { Injectable } from '../src/decorators/injectable';
 import { Get, Post } from '../src/decorators/methods';
 import { Body, Param, Query } from '../src/decorators/params';
 import { Dispatcher } from '../src/dispatcher';
-import { CreateUserDto } from '../src/dto/create-user.dto';
+import { CreateUserDto, CreateUserSchema } from '../src/dto/create-user.dto';
 
 const startServer = async (
   dispatcher: Dispatcher,
@@ -62,14 +62,15 @@ describe('Dispatcher', () => {
     @Controller('users')
     class UsersController {
       @Get(':id')
-      findOne(@Param('id') id: string) {
+      findOne(
+        @Param('id')
+        id: string,
+      ) {
         return { id };
       }
     }
 
-    const container = new Container();
-
-    const dispatcher = new Dispatcher(container, [UsersController]);
+    const dispatcher = new Dispatcher(new Container(), [UsersController]);
 
     const { server, baseUrl } = await startServer(dispatcher);
 
@@ -88,8 +89,13 @@ describe('Dispatcher', () => {
     @Controller('users')
     class UsersController {
       @Get()
-      findAll(@Query('limit') limit: string) {
-        return { limit };
+      findAll(
+        @Query('limit')
+        limit: string,
+      ) {
+        return {
+          limit,
+        };
       }
     }
 
@@ -112,7 +118,12 @@ describe('Dispatcher', () => {
     @Controller('users')
     class UsersController {
       @Post()
-      create(@Body() body: { email: string }) {
+      create(
+        @Body()
+        body: {
+          email: string;
+        },
+      ) {
         return body;
       }
     }
@@ -138,6 +149,84 @@ describe('Dispatcher', () => {
     expect(await response.json()).toEqual({
       email: 'test@example.com',
     });
+  });
+
+  it('passes valid body as CreateUserDto instance', async () => {
+    let receivedBody: CreateUserDto | undefined;
+
+    @Controller('users')
+    class UsersController {
+      @Post()
+      create(
+        @Body(CreateUserSchema)
+        body: CreateUserDto,
+      ) {
+        receivedBody = body;
+
+        return {
+          email: body.email,
+        };
+      }
+    }
+
+    const dispatcher = new Dispatcher(new Container(), [UsersController]);
+
+    const { server, baseUrl } = await startServer(dispatcher);
+
+    servers.push(server);
+
+    const response = await fetch(`${baseUrl}/users`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email: 'test@example.com',
+      }),
+    });
+
+    expect(response.status).toBe(201);
+
+    expect(receivedBody).toBeInstanceOf(CreateUserDto);
+
+    expect(await response.json()).toEqual({
+      email: 'test@example.com',
+    });
+  });
+
+  it('returns 400 with validation details for invalid DTO', async () => {
+    @Controller('users')
+    class UsersController {
+      @Post()
+      create(
+        @Body(CreateUserSchema)
+        body: CreateUserDto,
+      ) {
+        return body;
+      }
+    }
+
+    const dispatcher = new Dispatcher(new Container(), [UsersController]);
+
+    const { server, baseUrl } = await startServer(dispatcher);
+
+    servers.push(server);
+
+    const response = await fetch(`${baseUrl}/users`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email: 'not-an-email',
+      }),
+    });
+
+    expect(response.status).toBe(400);
+
+    const body = await response.json();
+
+    expect(JSON.stringify(body)).toMatch(/email/);
   });
 
   it('resolves controller dependencies through Container', async () => {
@@ -197,56 +286,13 @@ describe('Dispatcher', () => {
     expect(response.status).toBe(404);
   });
 
-  it('passes valid body as CreateUserDto instance', async () => {
-    let receivedBody: CreateUserDto | undefined;
-
+  it('returns 400 for malformed JSON body', async () => {
     @Controller('users')
     class UsersController {
       @Post()
       create(
         @Body()
-        body: CreateUserDto,
-      ) {
-        receivedBody = body;
-
-        return {
-          email: body.email,
-        };
-      }
-    }
-
-    const dispatcher = new Dispatcher(new Container(), [UsersController]);
-
-    const { server, baseUrl } = await startServer(dispatcher);
-
-    servers.push(server);
-
-    const response = await fetch(`${baseUrl}/users`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        email: 'test@example.com',
-      }),
-    });
-
-    expect(response.status).toBe(201);
-
-    expect(receivedBody).toBeInstanceOf(CreateUserDto);
-
-    expect(await response.json()).toEqual({
-      email: 'test@example.com',
-    });
-  });
-
-  it('returns 400 with validation details for invalid DTO', async () => {
-    @Controller('users')
-    class UsersController {
-      @Post()
-      create(
-        @Body()
-        body: CreateUserDto,
+        body: object,
       ) {
         return body;
       }
@@ -263,15 +309,14 @@ describe('Dispatcher', () => {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        email: 'not-an-email',
-      }),
+      body: '{not json',
     });
 
     expect(response.status).toBe(400);
 
-    const body = await response.json();
-
-    expect(JSON.stringify(body)).toMatch(/email/);
+    expect(await response.json()).toEqual({
+      statusCode: 400,
+      message: 'Invalid JSON body',
+    });
   });
 });

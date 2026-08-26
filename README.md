@@ -2,7 +2,7 @@
 
 Simple mini-Nest implementation written in TypeScript.
 
-The project started as a small IoC container and was extended with decorator-based HTTP routing, parameter injection, DTO transformation, and validation on top of `node:http`.
+The project started as a small IoC container and was extended with decorator-based HTTP routing, parameter injection, Zod validation, a full request lifecycle, exception handling, and request-scoped context on top of `node:http`.
 
 ## Install
 
@@ -27,6 +27,54 @@ docker compose run --rm api npm test
 
 ```bash
 npm run build
+```
+
+## Run HTTP server
+
+Start the example mini-Nest HTTP server on port `3000`:
+
+```bash
+npm start
+```
+
+The server exposes an example route:
+
+```text
+GET /users/:id
+```
+
+Example request:
+
+```bash
+curl -si http://localhost:3000/users/1
+```
+
+The response contains an automatically generated request id:
+
+```text
+X-Request-Id: <generated-id>
+```
+
+The same request id is also available inside nested services through `AsyncLocalStorage`.
+
+You can provide your own request id:
+
+```bash
+curl -si \
+  -H "X-Request-Id: my-request-123" \
+  http://localhost:3000/users/1
+```
+
+The server returns the same value in the response:
+
+```text
+X-Request-Id: my-request-123
+```
+
+To check only the request-id header:
+
+```bash
+curl -si http://localhost:3000/users/1 | grep -i x-request-id
 ```
 
 ## How IoC works
@@ -114,6 +162,27 @@ as route parameters.
 
 Routes are discovered from decorator metadata rather than from a hardcoded array of application paths.
 
+### Route priority
+
+Static routes are matched before dynamic parameter routes.
+
+For example, when both routes exist:
+
+```text
+GET /users/me
+GET /users/:id
+```
+
+a request to:
+
+```text
+GET /users/me
+```
+
+is handled by the static `me` route instead of treating `me` as the value of `id`.
+
+The router also walks the prototype chain, so decorated routes inherited from a base controller are discovered correctly.
+
 ## Parameter decorators
 
 The project supports:
@@ -174,24 +243,90 @@ handler.apply(controller, args);
 
 This is how a parameter decorator knows where its value should be inserted without reading the request directly.
 
+## Request lifecycle
+
+The dispatcher implements the following request lifecycle:
+
+```text
+HTTP Request
+    |
+    v
+Middleware
+    |
+    v
+Guard
+    |
+    v
+Interceptor (before)
+    |
+    v
+Pipe
+    |
+    v
+Handler
+    |
+    v
+Interceptor (after)
+    |
+    v
+HTTP Response
+
+Any error from the lifecycle
+    |
+    v
+Exception Filter
+```
+
+Each stage has its own responsibility:
+
+- **Middleware** runs at the beginning of the request lifecycle.
+- **Guard** decides whether the request is allowed to continue.
+- **Interceptor** wraps the next stages and can run logic both before and after them.
+- **Pipe** transforms or validates an argument immediately before it is passed to the handler.
+- **Handler** executes the controller method.
+- **Exception Filter** catches errors from the lifecycle and maps them to safe HTTP responses.
+
+The lifecycle order is verified by an integration test that expects exactly:
+
+```ts
+[
+  'middleware',
+  'guard',
+  'interceptor:before',
+  'pipe',
+  'handler',
+  'interceptor:after',
+];
+```
+
 ## Dispatcher
 
-The dispatcher handles the HTTP request lifecycle implemented in this project:
+The dispatcher coordinates the full HTTP request flow:
 
 ```text
 HTTP request
+    ↓
+create / reuse requestId
+    ↓
+AsyncLocalStorage context
     ↓
 parse URL
     ↓
 find matching route
     ↓
-extract route params / query / body
+Middleware
     ↓
-transform and validate DTO when needed
+Guard
     ↓
-resolve controller through Container
+Interceptor before
     ↓
-invoke controller method
+extract params / query / body
+    ↓
+Pipe
+    ↓
+Handler
+    ↓
+Interceptor after
     ↓
 serialize result to JSON
 ```
@@ -204,11 +339,39 @@ container.resolve(Controller);
 
 Controllers are therefore not created manually with `new`, and constructor dependencies are still resolved by the container from Part 1.
 
+## Auth Guard
+
+`AuthGuard` checks the `Authorization` request header before validation and before the controller handler is executed.
+
+A request without an authorization header is rejected with:
+
+```text
+HTTP 403 Forbidden
+```
+
+If the guard returns `false`, the handler is not invoked.
+
+This is the main difference between a guard and an interceptor: a guard decides whether the request may continue, while an interceptor wraps the following lifecycle stages and can observe both the incoming execution and its result.
+
+## Logging Interceptor
+
+`LoggingInterceptor` wraps the pipe and handler execution.
+
+It records the start time before calling `next()` and calculates the duration after the wrapped execution finishes.
+
+Example:
+
+```text
+GET /users/42 — 12.3 ms
+```
+
+Because it wraps `next()`, the interceptor can execute code both before and after the handler.
+
 ## Request body
 
 POST request bodies are read directly from the `IncomingMessage` stream.
 
-The dispatcher collects request chunks, converts them to a string, and parses the result with:
+The dispatcher collects request chunks, converts them into a string, and parses the result with:
 
 ```ts
 JSON.parse(rawBody);
@@ -222,60 +385,82 @@ A regular parameter such as:
 
 receives the parsed plain JavaScript object.
 
-## DTO validation
+Malformed JSON is treated as a client error.
 
-DTO validation is implemented using:
+For example:
 
-- `class-transformer`
-- `class-validator`
+```text
+{not json
+```
 
-Example DTO:
+returns:
 
-```ts
-export class CreateUserDto {
-  @IsEmail()
-  email!: string;
+```json
+{
+  "statusCode": 400,
+  "message": "Invalid JSON body"
 }
 ```
 
-For a controller method such as:
+instead of being exposed as an internal server error.
+
+## Zod validation pipe
+
+DTO validation is implemented with Zod 4.
+
+A schema can be attached directly to `@Body()`:
 
 ```ts
 @Post()
 create(
-  @Body() body: CreateUserDto,
-) {}
+  @Body(CreateUserSchema)
+  body: CreateUserDto,
+) {
+  return body;
+}
 ```
 
-TypeScript emits method parameter type metadata under:
+Example DTO and schema:
 
 ```ts
-design: paramtypes;
+import { z } from 'zod';
+
+export class CreateUserDto {
+  email!: string;
+}
+
+export const CreateUserSchema = z
+  .object({
+    email: z.email(),
+  })
+  .transform(data => Object.assign(new CreateUserDto(), data));
 ```
 
-The dispatcher reads the DTO class from that metadata.
+The dispatcher passes the parsed request body and schema to `ZodValidationPipe`.
 
-The validation pipe first converts the plain request body into a real DTO instance:
+The pipe validates input using:
 
 ```ts
-plainToInstance(CreateUserDto, body);
+schema.safeParse(value);
 ```
 
-and then validates that instance:
+For invalid input, validation details are built using the Zod 4 API:
 
 ```ts
-validate(instance);
+result.error.issues;
 ```
 
-This order is important because `class-validator` works with class instances rather than raw plain objects.
+For a valid body, the transformed value reaches the handler.
 
-For a valid request body, the controller receives an actual DTO instance:
+For this schema, the handler receives an actual DTO instance:
 
 ```ts
 body instanceof CreateUserDto === true;
 ```
 
-For an invalid body, the dispatcher returns HTTP `400` with validation details for all invalid fields.
+A `@Body()` decorator without a schema still receives the parsed JSON body without validation.
+
+Invalid input produces HTTP `400` with a list of invalid fields.
 
 Example:
 
@@ -286,19 +471,121 @@ Example:
   "errors": [
     {
       "field": "email",
-      "constraints": {
-        "isEmail": "email must be an email"
-      }
+      "constraints": ["Invalid email address"]
     }
   ]
 }
 ```
 
-Built-in parameter types such as `Object`, `String`, `Number`, `Boolean`, and `Array` are not treated as DTO classes and are not passed through DTO validation.
+## Exception Filter
+
+`ExceptionFilter` converts errors from the request lifecycle into HTTP responses.
+
+The current mappings are:
+
+```text
+ValidationError  -> 400
+BadRequestError  -> 400
+NotFoundError    -> 404
+unknown error    -> 500
+```
+
+A domain error such as:
+
+```ts
+throw new NotFoundError('User 42 not found');
+```
+
+is returned as an HTTP `404` with a meaningful message.
+
+A malformed JSON body results in `BadRequestError` and is returned as HTTP `400`.
+
+Unexpected errors are hidden from the client.
+
+For example:
+
+```ts
+throw new Error('boom');
+```
+
+returns:
+
+```json
+{
+  "statusCode": 500,
+  "message": "Internal Server Error"
+}
+```
+
+The original error message and stack trace are not exposed in the HTTP response.
+
+The exception filter sits at the outer level of the request lifecycle, so it also catches errors thrown by handlers, pipes, and interceptors.
+
+## Request context and AsyncLocalStorage
+
+Every incoming HTTP request receives a `requestId`.
+
+If the client sends:
+
+```text
+X-Request-Id
+```
+
+that value is reused.
+
+Otherwise, the dispatcher generates a new UUID.
+
+The same id is returned to the client in the response header:
+
+```text
+X-Request-Id
+```
+
+Request-specific context is stored using Node.js `AsyncLocalStorage` from `node:async_hooks`.
+
+The whole request lifecycle is executed inside:
+
+```ts
+AsyncLocalStorage.run(...);
+```
+
+so code deep in the dependency tree can access the current request id without receiving it explicitly as a method argument.
+
+For example:
+
+```text
+Controller
+    ↓
+UserContextService
+    ↓
+RequestIdService
+    ↓
+AsyncLocalStorage
+```
+
+The services do not need signatures such as:
+
+```ts
+someMethod(requestId: string)
+```
+
+Instead, they read the id from the current asynchronous context.
+
+### Why AsyncLocalStorage instead of a global variable?
+
+A global variable cannot safely hold request-specific data in an asynchronous HTTP server.
+
+While one request is waiting for an `await`, the Node.js event loop may start processing another request. If both requests store their ids in the same global variable, the second request can overwrite the value before the first request continues.
+
+The first request could then accidentally use the second request's id in a service, repository, or log entry.
+
+`AsyncLocalStorage` keeps an independent store for each asynchronous execution chain. Multiple requests can therefore run concurrently while each one continues to see its own `requestId`.
+
+This behavior is verified by a test that sends ten concurrent requests with different `X-Request-Id` values and checks that no id leaks into another response.
 
 ## Example requests
 
-Dynamic route parameter:
+### Dynamic route parameter
 
 ```text
 GET /users/42
@@ -321,7 +608,7 @@ passes:
 
 to the controller method.
 
-Query parameter:
+### Query parameter
 
 ```text
 GET /users?limit=5
@@ -344,7 +631,7 @@ passes:
 
 as a separate method argument.
 
-POST body:
+### POST body with Zod validation
 
 ```text
 POST /users
@@ -362,11 +649,30 @@ with:
 ```ts
 @Post()
 create(
-  @Body() body: CreateUserDto,
+  @Body(CreateUserSchema)
+  body: CreateUserDto,
 ) {}
 ```
 
-passes a validated `CreateUserDto` instance to the handler.
+passes the validated and transformed body to the handler.
+
+### Request id
+
+A client-provided request id:
+
+```text
+X-Request-Id: client-request-123
+```
+
+is available in deep services through `AsyncLocalStorage` and is returned unchanged in the response header.
+
+Example:
+
+```bash
+curl -si \
+  -H "X-Request-Id: client-request-123" \
+  http://localhost:3000/users/1
+```
 
 ## Tests
 
@@ -381,14 +687,27 @@ The test suite covers:
 - parameter metadata and argument indexes
 - controller prefix and method path composition
 - static and dynamic route matching
+- static routes taking priority over dynamic `:param` routes
+- inherited controller route discovery
 - `@Param()` injection
 - `@Query()` injection
 - `@Body()` parsing
+- malformed JSON returning HTTP 400
 - HTTP 404 responses
 - controller dependency resolution through the IoC container
-- DTO transformation into a class instance
-- invalid DTO response with HTTP 400 and validation details
-- valid DTO reaching the controller method
+- exact request lifecycle order
+- `AuthGuard` returning 403 before the handler
+- successful requests with an `Authorization` header
+- `LoggingInterceptor` request duration logging
+- Zod 4 request body validation
+- valid DTO transformation
+- invalid DTO response with HTTP 400 and field details
+- `NotFoundError` mapping to HTTP 404
+- unexpected errors mapping to a safe HTTP 500 response
+- generated `X-Request-Id`
+- reuse of a client-provided `X-Request-Id`
+- deep service access to request context
+- isolation of request context across ten concurrent HTTP requests
 
 Run all tests with:
 
@@ -399,5 +718,35 @@ npm test
 or inside Docker:
 
 ```bash
+docker compose run --rm api npm test
+```
+
+## Acceptance checks
+
+Check that no prohibited frameworks are used:
+
+```bash
+grep -RE "@nestjs|express|fastify" package.json src/
+```
+
+The command should return no matches.
+
+Check that Zod is used:
+
+```bash
+grep -rn "from 'zod'" src/
+```
+
+Check request-id usage in services:
+
+```bash
+grep -n "requestId" src/services/*.ts
+```
+
+Run the complete local verification:
+
+```bash
+npm test
+npm run build
 docker compose run --rm api npm test
 ```
